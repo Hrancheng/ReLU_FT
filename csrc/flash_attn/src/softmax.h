@@ -124,6 +124,152 @@ __forceinline__ __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &ten
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+/*--------------------------------------------------------------------------------
+Compute and return `tanh` of given scalar `a`.
+
+Solution credits--
+1. Demystifying the Nvidia Ampere Architecture through Microbenchmarking and Instruction-level Analysis
+https://arxiv.org/pdf/2208.11174
+
+2. https://forums.developer.nvidia.com/t/hardware-accelerated-computation-of-the-sigmoid-logistic-function/266206
+Njuffa: contributor at NVIDIA blogs who mentions `tanh.approx.f32`.
+--------------------------------------------------------------------------------*/
+__forceinline__ __device__ float fast_tanhf (float a)
+{
+    float r;
+    asm ("tanh.approx.f32 %0,%1; \n\t" : "=f"(r) : "f"(a));
+    return r;
+}
+
+
+/*--------------------------------------------------------------------------------
+Compute element-wise sigmoid of given tensor after scaling it.
+
+:param tensor: The tensor whose sigmoid needs to be computed.
+:param scale: The scale with which to multiply the tensor.
+
+:returns: Element-wise sigmoid `sigmoid(scale * tensor)`.
+
+Notes--
+1. The relation between `softmax` and `sigmoid` is:
+`sigmoid(x) = 0.5*(1 + tanh(0.5*x))`. However, in our code, we take the
+factor of `0.5` from `0.5*x` and incorporate it in `scale` variable by
+pre-multiplying it.
+--------------------------------------------------------------------------------*/
+template <typename Engine0, typename Layout0>
+__forceinline__ __device__
+void apply_sigmoid(Tensor<Engine0, Layout0> &tensor, const float scale) {
+    #pragma unroll
+    for (int mi = 0; mi < size(tensor); ++mi) {
+        tensor(mi) = fmaf(0.5, fast_tanhf(tensor(mi) * scale), 0.5f);
+    }
+}
+
+
+template <typename Engine0, typename Layout0>
+__forceinline__ __device__
+void apply_relu(Tensor<Engine0, Layout0> &tensor, const float scale) {
+    #pragma unroll
+    for (int mi = 0; mi < size(tensor); ++mi) {
+        // Apply ReLU activation: if tensor(mi) * scale < 0, set to 0; otherwise, retain the value.
+        tensor(mi) = tensor(mi) * scale > 0 ? tensor(mi) * scale : 0.0f;
+    }
+}
+
+
+
+/*--------------------------------------------------------------------------------
+Define per-location application of backprop of sigmoid attention.
+
+:param a: The value of a pixel of sigmoid attention `p`.
+:param b: The corrected `dp` value based on the check in the code.
+
+:returns: A possibly faster answer of `a*(1 - a)*b`, which is the gradient
+    backpropagated through sigmoid attention mechanism.
+
+Notes--
+1. The intuition is that `a*(1 - a)*b = a*b - a^2 * b = fmaf(-a, a*b, a*b)`.
+Thus, maybe we can compute the answer faster with 2 `fmaf` applications as:
+```
+float ab = fmaf(a, b, 0);
+return fmaf(-a, ab, ab);
+```
+--------------------------------------------------------------------------------*/
+__forceinline__ __device__
+float fmaf_sigmoid_backprop(float a, float b) {
+    float ab = a * b;
+    return fmaf(-a, ab, ab);
+}
+
+
+/*--------------------------------------------------------------------------------
+Define a possibly more efficient implementation of passing gradients back
+from the outputs of the attention mechanism to its inputs.
+
+:param p: The tensor of output of sigmoid attention activations.
+:param dp: The tensor of gradient of loss with respect to sigmoid attention activations.
+
+:returns: Nothing. The `dp` is updated inplace with the answer.
+--------------------------------------------------------------------------------*/
+template <bool Is_dropout, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__forceinline__ __device__
+void apply_sigmoid_backprop(
+    Tensor<Engine0, Layout0> &p,
+    Tensor<Engine1, Layout1> &dp
+) {
+    // Unroll for each row.
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(dp); ++mi) {
+        // Unroll for each column.
+        # pragma unroll
+        for (int ni = 0; ni < size<1>(dp); ++ni) {
+            // Compute the tri-conditional.
+            const float a = p(mi, ni);
+            const float b = dp(mi, ni);
+            const float corrected_b = !Is_dropout || a >= 0 ? b : 0.f;
+
+            // Compute and fill the answer in the second input tensor.
+            dp(mi, ni) = fmaf_sigmoid_backprop(
+                /*a=*/a,
+                /*b=*/corrected_b
+            );
+        }
+    }
+}
+
+
+template <bool Is_dropout, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__forceinline__ __device__
+void apply_relu_backprop(
+    Tensor<Engine0, Layout0> &p,
+    Tensor<Engine1, Layout1> &dp
+) {
+    // Unroll for each row.
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(dp); ++mi) {
+        // Unroll for each column.
+        # pragma unroll
+        for (int ni = 0; ni < size<1>(dp); ++ni) {
+            // Compute the tri-conditional.
+            const float a = p(mi, ni);
+            const float b = dp(mi, ni);
+            const float corrected_b = !Is_dropout || a >= 0 ? b : 0.f;
+
+            // Compute and fill the answer in the second input tensor.
+        dp(mi, ni) = a > 0 ? corrected_b : 0.f;
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+
 template <int kNRows>
 struct Softmax {
 

@@ -145,8 +145,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor gdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dq_accum_ptr) + row_offset_dq_accum),
                                   Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                   make_stride(params.h * params.d_rounded, _1{}));
-    Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
-                              Shape<Int<kBlockM>>{}, Stride<_1>{});
+
+
+
+    // delete
+
     Tensor gdPsum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dsoftmax_sum) + row_offset_dpsum),
                                 Shape<Int<kBlockM>>{}, Stride<_1>{});
 
@@ -401,12 +404,13 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     static_assert(decltype(size<0>(taccScS))::value == 4);
     // Convert to ((2, 2), MMA_N, MMA_N) then take only the row indices.
     Tensor taccScS_row = logical_divide(taccScS, Shape<_2>{})(make_coord(0, _), _, 0);
-    Tensor lse = make_tensor<ElementAccum>(Shape<Int<decltype(size(taccScS_row))::value>>{});
-    #pragma unroll
-    for (int mi = 0; mi < size(lse); ++mi) {
-        const int row = get<0>(taccScS_row(mi));
-        lse(mi) = Is_even_MN || row < binfo.actual_seqlen_q - m_block * kBlockM ? gLSE(row) : INFINITY;
-    }
+
+
+    //// diff here
+    // delete
+    //// diff here
+
+
     // We want LSE = inf if the row is OOB. In that case Q would be zero, K would be zero,
     // and scores would be zero. With LSE = 0, probs will be all 1's, and when we multiply
     // with V (which would be zero), we're fine. However, with ALiBi, we might modify these
@@ -428,11 +432,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     flash::cp_async_fence();
 
     // if (cute::thread0()) { print(tdOgdO.layout()); printf("\n"); print(tdOrdO); print(tdOrO); }
-    if (Is_first) {
-        cute::copy(tdOrdO, tdOsdO);
-        dot_do_o<Kernel_traits::kGmemThreadsPerRow>(tdOrdO, tdOrO, gdPsum,
-                                                    Kernel_traits::kNThreads / (Kernel_traits::kGmemThreadsPerRow), params.p_dropout);
-    }
+
+    //// diff here
+    //delete
+    //// diff here
 
     if (Kernel_traits::Is_V_in_regs) {
         cute::cp_async_wait<1>();
@@ -456,10 +459,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         clear(acc_s);
         cute::cp_async_wait<0>();
         __syncthreads();
-
-        Tensor dP_sum = make_fragment_like(lse);
-        #pragma unroll
-        for (int mi = 0; mi < size(lse); ++mi) { dP_sum(mi) = gdPsum(get<0>(taccScS_row(mi))); }
+        //// diff here
+        // delete
+        //// diff here
 
         // if (cute::thread0()) { print(sK); }
         // Tensor tSrK_copy_view = smem_thr_copy_KV.retile_D(tSrK);
@@ -470,20 +472,22 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // if (cute::thread0()) { print(tSrK); }
         flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
                     smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
-
-        if constexpr (Is_softcap) {
-            flash::apply_softcap(acc_s, params.softcap);
-        }
+        
+        //// diff here
+        // delete
+        //// diff here
 
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (row=(2, MMA_N), col=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         // if (cute::thread(32, 0)) { print(scores); }
 
         // Softcapping - calculating dTanh and scaling dS later with it
-        Tensor dtanh = make_tensor_like(scores);
-        if constexpr (Is_softcap) {
-            flash::calculate_dtanh(scores, dtanh, params.softcap);
-        }
+
+
+
+        //// diff here
+        //delete
+        //// diff here
 
         // Alibi
         if (Has_alibi) {
@@ -528,9 +532,20 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
         }
 
+
+
+
+        const float half_softmax_scale = params.scale_softmax * 0.5;
+        flash::apply_relu(/*tensor=*/scores, /*scale=*/half_softmax_scale);
+
+
+
+
+
+
+
         // if (cute::thread(32, 0)) { print(scores); }
         // Compute the exponential value.
-        flash::scale_apply_exp2</*scale_max=*/false>(scores, lse, params.scale_softmax_log2);
         if constexpr (Is_dropout) {
             int warp_id = tidx / 32;
             int block_row_idx = m_block * (kBlockM / 16) + warp_id % AtomLayoutMS;
@@ -578,18 +593,19 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
         // Reshape acc_dp from (MMA=4, MMA_N, MMA_N) to (row=(2, MMA_N), col=(2, MMA_N))
         Tensor dS = make_tensor(acc_dp.data(), scores.layout());
-        auto pointwise_mult = [](float p, float dp, float d) {
-            return p * (!Is_dropout || p >= 0 ? dp - d : d);
-        };
-        #pragma unroll
-        for (int mi = 0; mi < size<0>(dS); ++mi) {
-            #pragma unroll
-            for (int ni = 0; ni < size<1>(dS); ++ni) {
-                float scaled_ds = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi));
-                if constexpr (Is_softcap) { scaled_ds *= dtanh(mi, ni); }
-                dS(mi, ni) = scaled_ds;
-            }
-        }
+        //// diff here
+
+        ////sigmoid added here
+
+
+
+       flash::apply_relu_backprop<Is_dropout>(/*p=*/scores, /*dp=*/dS);
+
+
+        ///////delete here
+        // delete
+
+        //////////////
         // if (cute::thread0()) { print(dS); }
 
         Tensor acc_dq = partition_fragment_C(tiled_mma_dq, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
@@ -639,6 +655,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         if (m_block > m_block_min) {
             // Advance gdO
             tdOgdO.data() = tdOgdO.data() + (-int(kBlockM * params.do_row_stride));
+
+
+
+            //////modify here
             if (Is_first) {
                 tdOgO.data() = tdOgO.data() + (-int(kBlockM * params.o_row_stride));
                 flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_dO, tdOgdO, tdOrdO, tQcQ, tQpQ);
@@ -652,13 +672,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         flash::gemm(acc_dq, tdQrdS, tdQrKt, tdQsdS, tdQsKt, tiled_mma_dq,
                     smem_tiled_copy_dS, smem_tiled_copy_Kt, smem_thr_copy_dS, smem_thr_copy_Kt);
         // if (cute::thread0()) { print(acc_dq); }
+        /////////////////delete here
+        // delete
+        /////////////////delete here
 
-        if (m_block > m_block_min) {
-            gLSE.data() = gLSE.data() + (-int(kBlockM));
-            #pragma unroll
-            for (int mi = 0; mi < size(lse); ++mi) { lse(mi) = gLSE(get<0>(taccScS_row(mi))); }
-            gdPsum.data() = gdPsum.data() + (-int(kBlockM));
-        }
 
         if (!Is_last) {
             // Reshape acc_dq from (4, 1, 2) to (4, 2, 1) to write to gdQaccum
@@ -697,11 +714,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             flash::cp_async_fence();
         }
 
-        if (Is_first && m_block > m_block_min) {
-            cute::copy(tdOrdO, tdOsdO);
-            dot_do_o<Kernel_traits::kGmemThreadsPerRow>(tdOrdO, tdOrO, gdPsum,
-                                                        Kernel_traits::kNThreads / (Kernel_traits::kGmemThreadsPerRow), params.p_dropout);
-        }
+
+
+        /////////////delete here
+
+        // delete
+        ///////////////delete here
 
         if (Is_last) {
             __syncthreads();
